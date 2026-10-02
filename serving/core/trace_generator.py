@@ -1025,6 +1025,21 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
 
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
+    # The trace schema has no dedicated KV-cache operand.  Represent a remote
+    # KV read through its memory-load (weight) slot so the Chakra converter
+    # creates a memory node that the attention compute directly depends on. kv 전송이 cxl에서 npu mem으로 이동하기 전에 attention을 하는걸 방지
+    # Only cached history is transferred: the current step's K/V was produced
+    # by qkv_proj on the NPU and is already local.
+    if layer_name == "attention":
+        kv_loc = get_device(ctx.placement, layer_num, layer_name, "kv_loc")
+        if kv_loc != "LOCAL":
+            kv_history_tokens = (
+                bctx.kv_prefill + bctx.n_decode * bctx.kv_decode_mean
+            )
+            kv_dim_per_rank = ctx.kv_head * ctx.head_dim // max(ctx.tp_size, 1)
+            wt_loc = kv_loc
+            wt = 2 * kv_history_tokens * kv_dim_per_rank * ctx.kv_fp
+
     lines.append((layer_name, str(latency_ns), input_loc, str(inp), wt_loc,
                   str(wt), output_loc, str(out), comm_type, str(comm_size), batch_tag))
 

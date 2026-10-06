@@ -85,6 +85,12 @@ class Scheduler:
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
+    def get_npu_memory_pressure(self):
+        """Return the fraction of total NPU memory currently in use."""
+        if self.memory.npu_mem == 0:
+            return 0.0
+        return self.memory.npu_used / self.memory.npu_mem
+
     # ==================== scheduling ====================
 
     def schedule(self, current, sys, batch_id=-1):

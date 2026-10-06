@@ -1218,6 +1218,40 @@ def main():
     print_markup(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
     print_markup(f"Throughput per {log_interval:g} sec (\\[prompt_throughput], \\[gen_throughput]): {throughput}")
     print_rule()
+    if request_routing_policy == "CUSTOM":
+        routing_metadata = router.get_custom_routing_metadata()
+        # Machine-readable record for automated experiment analysis.
+        print_markup(
+            "CUSTOM_ROUTING_METADATA "
+            + json.dumps(routing_metadata, sort_keys=True)
+        )
+        print_rule("[sim.tagline]CUSTOM Routing Results[/]")
+        for role, stats in routing_metadata["roles"].items():
+            if stats["selections"] == 0:
+                continue
+            # Report mode activation frequency and transition count.
+            print_markup(
+                f"{role.capitalize()} selections: {stats['selections']}, "
+                f"memory mode: {stats['memory_mode_selections']} "
+                f"({stats['memory_mode_ratio'] * 100:.2f}%), "
+                f"mode transitions: {stats['mode_transitions']}"
+            )
+            # Report how routing decisions were distributed across instances.
+            print_markup(
+                f"{role.capitalize()} requests by instance: "
+                f"{stats['requests_by_instance']}"
+            )
+            # Report selected, global-peak, and max-minus-min pressure metrics.
+            print_markup(
+                f"{role.capitalize()} pressure: selected avg/max "
+                f"{stats['selected_pressure_avg']:.4f}/"
+                f"{stats['selected_pressure_max']:.4f}, highest avg/max "
+                f"{stats['highest_pressure_avg']:.4f}/"
+                f"{stats['highest_pressure_max']:.4f}, imbalance avg/max "
+                f"{stats['pressure_imbalance_avg']:.4f}/"
+                f"{stats['pressure_imbalance_max']:.4f}"
+            )
+        print_rule()
     if any_prefix_caching:
         print_rule("[sim.tagline]Prefix Caching Results[/]")
         print_markup(f"Total requested prompt tokens:                                      {total_requested_tokens}")

@@ -9,7 +9,7 @@ class Router:
             self,
             num_instances,
             schedulers, req_num,
-            routing_policy="RR",
+            routing_policy="RR",  # round robin
             seed=42
     ):
         self.schedulers = schedulers
@@ -24,6 +24,23 @@ class Router:
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
+        self._custom_stats = { #추가된 통계
+            role: {
+                "selections": 0,                # Total routing decisions
+                "load_mode_selections": 0,      # Decisions made by LOAD mode
+                "memory_mode_selections": 0,    # Decisions made by memory mode
+                "mode_transitions": 0,          # LOAD/memory mode switches
+                "last_mode": None,              # Mode used by the last decision
+                "requests_by_instance": {},     # Routed requests per instance ID
+                "selected_pressure_sum": 0.0,   # Sum for selected-pressure mean
+                "selected_pressure_max": 0.0,   # Peak selected pressure
+                "highest_pressure_sum": 0.0,    # Sum of per-decision peak pressure
+                "highest_pressure_max": 0.0,    # Peak pressure seen in the run
+                "pressure_imbalance_sum": 0.0,  # Sum of max-minus-min pressure
+                "pressure_imbalance_max": 0.0,  # Largest max-minus-min pressure
+            }
+            for role in ("prefill", "decode")
+        }
 
         # Pending requests (loaded but not yet routed)
         self._pending_requests = []
@@ -94,7 +111,110 @@ class Router:
         return best_idx
 
     def _custom_select(self, schedulers, role):
-        raise NotImplementedError("Implement custom routing policy.")
+        if len(schedulers) <= 1:
+            if schedulers:
+                pressure = schedulers[0].get_npu_memory_pressure()
+                self._record_custom_selection(
+                    role, schedulers, 0, "load", [pressure]
+                )
+            return 0
+
+        best_idx = 0
+        best_pressure = float('inf')
+        worst_pressure = 0.0
+        num_instances = len(schedulers)
+        start = self._get_counter(role) % num_instances
+        pressures = [0.0] * num_instances
+
+        for offset in range(num_instances):
+            idx = (start + offset) % num_instances
+            pressure = schedulers[idx].get_npu_memory_pressure()
+            pressures[idx] = pressure
+
+            if pressure < best_pressure:
+                best_pressure = pressure
+                best_idx = idx
+
+            worst_pressure = max(worst_pressure, pressure)
+
+        if worst_pressure >= 0.8:
+            self._set_counter(
+                role,
+                (best_idx + 1) % num_instances
+            )
+            selected_idx = best_idx
+            mode = "memory"
+        else:
+            selected_idx = self._least_load_select(schedulers, role)
+            mode = "load"
+
+        self._record_custom_selection(
+            role, schedulers, selected_idx, mode, pressures
+        )
+        return selected_idx
+
+    def _record_custom_selection(
+            self, role, schedulers, selected_idx, mode, pressures):
+        stats = self._custom_stats[role]
+        stats["selections"] += 1
+        stats[f"{mode}_mode_selections"] += 1
+
+        if stats["last_mode"] is not None and stats["last_mode"] != mode:
+            stats["mode_transitions"] += 1
+        stats["last_mode"] = mode
+
+        instance_id = schedulers[selected_idx].instance_id
+        counts = stats["requests_by_instance"]
+        counts[instance_id] = counts.get(instance_id, 0) + 1
+
+        selected_pressure = pressures[selected_idx]
+        highest_pressure = max(pressures)
+        imbalance = highest_pressure - min(pressures)
+        stats["selected_pressure_sum"] += selected_pressure
+        stats["selected_pressure_max"] = max(
+            stats["selected_pressure_max"], selected_pressure
+        )
+        stats["highest_pressure_sum"] += highest_pressure
+        stats["highest_pressure_max"] = max(
+            stats["highest_pressure_max"], highest_pressure
+        )
+        stats["pressure_imbalance_sum"] += imbalance
+        stats["pressure_imbalance_max"] = max(
+            stats["pressure_imbalance_max"], imbalance
+        )
+
+    def get_custom_routing_metadata(self):
+        """Return aggregate CUSTOM routing statistics for logs and analysis."""
+        metadata = {"memory_pressure_threshold": 0.8, "roles": {}}
+        for role, stats in self._custom_stats.items():
+            selections = stats["selections"]
+            # Keep empty roles numeric and avoid division by zero in the log.
+            denominator = selections if selections else 1
+            metadata["roles"][role] = {
+                "selections": selections,
+                "load_mode_selections": stats["load_mode_selections"],
+                "memory_mode_selections": stats["memory_mode_selections"],
+                "memory_mode_ratio": (
+                    stats["memory_mode_selections"] / denominator
+                ),
+                "mode_transitions": stats["mode_transitions"],
+                "requests_by_instance": dict(sorted(
+                    stats["requests_by_instance"].items()
+                )),
+                "selected_pressure_avg": (
+                    stats["selected_pressure_sum"] / denominator
+                ),
+                "selected_pressure_max": stats["selected_pressure_max"],
+                "highest_pressure_avg": (
+                    stats["highest_pressure_sum"] / denominator
+                ),
+                "highest_pressure_max": stats["highest_pressure_max"],
+                "pressure_imbalance_avg": (
+                    stats["pressure_imbalance_sum"] / denominator
+                ),
+                "pressure_imbalance_max": stats["pressure_imbalance_max"],
+            }
+        return metadata
 
     # -----------------------------------------------------------------------
     # Request loading and real-time routing

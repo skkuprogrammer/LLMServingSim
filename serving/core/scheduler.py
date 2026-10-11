@@ -501,6 +501,34 @@ class Scheduler:
     def is_request_empty(self):
         return not self.waiting and not self.running and not self.inflight
 
+    def get_memory_pressure(self):
+        pool = self.kv.npu_pool
+
+        kv_used_blocks = pool.used_blocks
+        kv_free_blocks = pool.get_num_free_blocks()
+        kv_total_blocks = pool.num_blocks
+        kv_pressure = pool.usage()
+
+        hbm_used_bytes = self.memory.npu_used
+        hbm_total_bytes = self.memory.npu_mem
+
+        hbm_pressure = (
+            hbm_used_bytes / hbm_total_bytes
+            if hbm_total_bytes > 0
+            else 0.0
+        )
+
+        return {
+            "instance_id": self.instance_id,
+            "kv_pressure": kv_pressure,
+            "kv_used_blocks": kv_used_blocks,
+            "kv_free_blocks": kv_free_blocks,
+            "kv_total_blocks": kv_total_blocks,
+            "hbm_pressure": hbm_pressure,
+            "hbm_used_bytes": hbm_used_bytes,
+            "hbm_total_bytes": hbm_total_bytes,
+        }
+
     def print_result(self):
         # Extract ttft, tpot, and itl values from the completed requests
         ttft_values = [req.ttft for req in self.done]

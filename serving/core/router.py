@@ -10,7 +10,8 @@ class Router:
             num_instances,
             schedulers, req_num,
             routing_policy="RR",  # round robin
-            seed=42
+            seed=42,
+            memory_pressure_threshold=0.8,
     ):
         self.schedulers = schedulers
         self.num_instances = num_instances
@@ -21,10 +22,13 @@ class Router:
         self.req_num = req_num
         self.routing_policy = routing_policy.upper()
         self.seed = seed
+        if not 0 < memory_pressure_threshold <= 1:
+            raise ValueError("memory_pressure_threshold must be in (0, 1]")
+        self.memory_pressure_threshold = memory_pressure_threshold
         self._rnd = random.Random(seed) if seed is not None else random
         self.prefill_rr_counter = 0
         self.decode_rr_counter = 0
-        self._custom_stats = { #추가된 통계
+        self._custom_stats = { # Per-role metrics collected for CUSTOM routing.
             role: {
                 "selections": 0,                # Total routing decisions
                 "load_mode_selections": 0,      # Decisions made by LOAD mode
@@ -113,7 +117,7 @@ class Router:
     def _custom_select(self, schedulers, role):
         if len(schedulers) <= 1:
             if schedulers:
-                pressure = schedulers[0].get_npu_memory_pressure()
+                pressure = schedulers[0].get_memory_pressure()["hbm_pressure"]
                 self._record_custom_selection(
                     role, schedulers, 0, "load", [pressure]
                 )
@@ -128,7 +132,7 @@ class Router:
 
         for offset in range(num_instances):
             idx = (start + offset) % num_instances
-            pressure = schedulers[idx].get_npu_memory_pressure()
+            pressure = schedulers[idx].get_memory_pressure()["hbm_pressure"]
             pressures[idx] = pressure
 
             if pressure < best_pressure:
@@ -137,7 +141,7 @@ class Router:
 
             worst_pressure = max(worst_pressure, pressure)
 
-        if worst_pressure >= 0.8:
+        if worst_pressure >= self.memory_pressure_threshold:
             self._set_counter(
                 role,
                 (best_idx + 1) % num_instances
@@ -185,7 +189,7 @@ class Router:
 
     def get_custom_routing_metadata(self):
         """Return aggregate CUSTOM routing statistics for logs and analysis."""
-        metadata = {"memory_pressure_threshold": 0.8, "roles": {}}
+        metadata = {"memory_pressure_threshold": self.memory_pressure_threshold, "roles": {}}
         for role, stats in self._custom_stats.items():
             selections = stats["selections"]
             # Keep empty roles numeric and avoid division by zero in the log.

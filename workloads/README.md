@@ -104,6 +104,20 @@ and the format reference is
 | File | Description |
 | --- | --- |
 | `example_trace.jsonl` | Small example trace for quick testing |
+| `pressure_routing_96_requests.jsonl` | Synthetic routing stress test: 96 requests, 2,048 input + 512 output tokens each, arriving every 20 ms. No token IDs/prefix sharing. |
+
+The pressure-routing workload is paired with
+`configs/cluster/pressure_routing_{2,4}_instance.json`: 2 or 4 RTX 4090
+instances, each with 24 GiB HBM and `mem_util=0.9`. It is intended to exercise
+the CUSTOM router's 80% HBM-pressure branch, not to represent measured user
+traffic. Run from the repository root with, for example,
+`./serving/run_instance.sh 4 CUSTOM 1 96 pressure`; compare against `LOAD` or
+`RR` using the same arguments. Per-request results and complete simulator logs
+(including `CUSTOM_ROUTING_METADATA`) are saved in `outputs/real/`. Check the
+metadata's `memory_mode_selections` before interpreting a pressure-mode result.
+The threshold can be tested without changing the default policy, for example
+`./serving/run_instance.sh 4 CUSTOM 1 96 pressure 0.7`. A four-GPU comparison
+with RR and RAND is recorded in `experiments/pressure_routing_4gpu.md`.
 
 ## Generating workloads
 

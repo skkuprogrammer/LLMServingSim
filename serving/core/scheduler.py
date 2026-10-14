@@ -85,12 +85,6 @@ class Scheduler:
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
 
-    def get_npu_memory_pressure(self):
-        """Return the fraction of total NPU memory currently in use."""
-        if self.memory.npu_mem == 0:
-            return 0.0
-        return self.memory.npu_used / self.memory.npu_mem
-
     # ==================== scheduling ====================
 
     def schedule(self, current, sys, batch_id=-1):
@@ -502,6 +496,7 @@ class Scheduler:
         return not self.waiting and not self.running and not self.inflight
 
     def get_memory_pressure(self):
+        """Return KV-pool and total HBM pressure metrics for this instance."""
         pool = self.kv.npu_pool
 
         kv_used_blocks = pool.used_blocks

@@ -280,6 +280,8 @@ def main():
     parser.add_argument('--request-routing-policy', type=str, choices=['LOAD', 'RR', 'RAND', 'CUSTOM'], default='LOAD',
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), CUSTOM (user-defined)')
+    parser.add_argument('--custom-memory-threshold', type=float, default=0.8,
+                        help='CUSTOM routing HBM-pressure threshold in (0, 1]; default: 0.8')
     parser.add_argument('--expert-routing-policy', type=str,
                         choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
                         default='BALANCED',
@@ -564,7 +566,8 @@ def main():
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
     # Global Request Router
-    router = Router(num_instances, schedulers, num_req, request_routing_policy)
+    router = Router(num_instances, schedulers, num_req, request_routing_policy,
+                    memory_pressure_threshold=args.custom_memory_threshold)
     # Power Modeling if enabled
     if power_modeling:
         power_model = PowerModel(power_configs)

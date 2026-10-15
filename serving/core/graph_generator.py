@@ -135,6 +135,31 @@ def _get_llm_converter():
     return _LLMConverter
 
 
+def generate_transfer_graph(batch, hardware, instance_id, npu_offset, inputs_root):
+    """Write a transfer-only Chakra graph using the installed converter API."""
+    from chakra.src.third_party.utils.protolib import encodeMessage
+
+    name = f'{hardware}/{batch.model}/instance{instance_id}_batch{batch.batch_id}'
+    output = input_path(inputs_root, 'workload', name, 'llm')
+    os.makedirs(os.path.dirname(output), exist_ok=True)
+    converter = _get_llm_converter()('', output, 1, npu_offset, False)
+    nodes = []
+    for plan in batch.kv_transfers:
+        make = (converter.get_memory_store_node if plan.direction == 'gpu_to_cxl'
+                else converter.get_memory_load_node)
+        node = make(f'kv_{plan.direction}_{plan.transfer_id}', 'KV',
+                    f'CXL:{plan.cxl_device_id}', plan.nbytes)
+        if nodes:
+            converter.add_parent(node, nodes[-1])
+        nodes.append(node)
+    if not nodes:
+        raise ValueError('Transfer graph requires a transfer plan')
+    with open(f'{output}.{npu_offset}.et', 'wb') as stream:
+        encodeMessage(stream, converter.get_global_metadata())
+        for node in nodes:
+            encodeMessage(stream, node)
+
+
 def generate_graph(batch, hardware, num_npus, node_id=0, instance_id=0, npu_offset=0, enable_local_offloading=False, event=False, workload_name=None, inputs_root=None, save_trace_text=False, *, trace):
 
     cwd = os.getcwd()

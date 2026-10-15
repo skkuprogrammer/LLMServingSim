@@ -248,6 +248,42 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
     return runtime_configs
 
 
+def _build_cxl_execution_pools(cluster, instances, runtime_configs, kv_offload_mode):
+    """Build shared, non-caching pools for single-rank KV migration.
+
+    In explicit mode cxl_mem_size is capacity per physical CXL device in GiB.
+    """
+    if kv_offload_mode == 'disabled':
+        return {}
+    if kv_offload_mode != 'explicit':
+        raise ValueError(f"Unsupported KV offload mode: {kv_offload_mode}")
+    if not instances or len(instances) != len(runtime_configs):
+        raise ValueError("CXL execution pools require matching instance configurations")
+    num_devices = cluster.get("cxl_num_devices", 0)
+    capacity = cluster.get("cxl_mem_size", 0)
+    if type(num_devices) is not int or num_devices <= 0 or capacity <= 0:
+        raise ValueError("Explicit KV offload requires positive CXL capacity and device count")
+    shapes = set()
+    for instance, cfg in zip(instances, runtime_configs):
+        if any(instance.get(key, 1) != 1 for key in ('num_npus', 'tp_size', 'pp_size', 'ep_total')):
+            raise ValueError("Explicit KV offload pool wiring currently requires single-rank instances")
+        if cfg["enable_prefix_caching"]:
+            raise ValueError("Explicit KV offload pool wiring requires prefix caching disabled")
+        shapes.add((instance["model_name"], cfg["fp"], cfg["kv_cache_dtype"], cfg["block_size"]))
+    if len(shapes) != 1:
+        raise ValueError("Shared CXL execution pools require matching model, dtype, and block size")
+    model, fp, kv_dtype, block_size = shapes.pop()
+    if type(block_size) is not int or block_size <= 0:
+        raise ValueError("CXL execution pool block size must be a positive integer")
+    bytes_per_block = full_cluster_kv_bytes_per_token(model, fp, kv_dtype) * block_size
+    num_blocks = int(capacity * GB_TO_BYTE) // bytes_per_block
+    return {
+        device_id: BlockPool(Device.CXL, num_blocks, block_size, bytes_per_block,
+                             enable_caching=False)
+        for device_id in range(num_devices)
+    }
+
+
 def main():
     # ----------------------------------------------------------------------------------------------
     # LLMServingSim runs in astra-sim directory for easy path configuration
@@ -309,6 +345,13 @@ def main():
                         help='enable second-tier prefix cache pooling across instances within a node')
     parser.add_argument('--prefix-storage', type=str, choices=['None', 'CPU', 'CXL'], default='None',
                         help='storage medium for the second-tier prefix cache pool: None (NPU only), CPU, or CXL')
+    parser.add_argument('--offload', action='store_true',
+                        help='enable completion-aware request KV migration between GPU and CXL; '
+                        'requires single-rank execution and --no-enable-prefix-caching')
+    parser.add_argument('--kv-offload-mode', choices=['disabled', 'explicit'], default=None,
+                        help='KV migration accounting mode: disabled preserves the existing '
+                        'allocation, prefix caching, and kv_loc transfer behavior (default); '
+                        'explicit enables the same migration path as --offload')
     parser.add_argument('--enable-local-offloading', action='store_true', default=False,
                         help='enable weight offloading to local (NPU) memory. '
                         'Recommended to disable unless weight memory access is not counted in profiling')
@@ -375,6 +418,10 @@ def main():
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
 
     args = parser.parse_args()
+
+    if args.offload and args.kv_offload_mode == 'disabled':
+        parser.error('--offload conflicts with --kv-offload-mode disabled')
+    args.kv_offload_mode = 'explicit' if args.offload else (args.kv_offload_mode or 'disabled')
     
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
@@ -427,6 +474,21 @@ def main():
     pim_models = cluster["pim_models"]
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
+    if args.kv_offload_mode == 'explicit':
+        if len(instances) != 1 or network_backend != 'analytical':
+            parser.error('--offload currently requires one independent analytical instance')
+        inst, cfg = instances[0], instance_runtime_configs[0]
+        if (inst.get('dp_group') is not None or inst.get('pd_type') is not None
+                or power_modeling or cfg['enable_attn_offloading']
+                or cfg['enable_sub_batch_interleaving']):
+            parser.error('--offload does not yet support DP/PD, PIM, power modeling, or interleaving')
+        if any_prefix_caching:
+            parser.error('--offload requires --no-enable-prefix-caching (including instance overrides)')
+        # Execution always consumes restored GPU KV. Charging kv_loc reads as
+        # well would bill the same data twice. Weight placement stays unchanged.
+        for entry in [placement[0]['default'], *placement[0]['block'],
+                      *placement[0]['layer'].values()]:
+            entry['kv_loc'] = 'LOCAL'
     # ----------------------------------------- Set config -----------------------------------------
     # Automatic network, memory configuration
     # If you want to set more specific information such as latency, look at config.py and each json file
@@ -513,6 +575,8 @@ def main():
         else:
             raise NotImplementedError(f"Prefix storage type {prefix_storage} is not supported or memory size is invalid")
 
+    cxl_execution_pools = _build_cxl_execution_pools(
+        cluster, instances, instance_runtime_configs, args.kv_offload_mode)
     schedulers = []
     for instance_id, instance in enumerate(instances):
         prefix_pool_index = prefix_pool_inst_mapping[instance_id]
@@ -542,6 +606,8 @@ def main():
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
             npu_memory_utilization=inst_cfg["npu_memory_utilization"],
             reserve_full_isl=inst_cfg["reserve_full_isl"],
+            kv_offload_mode=args.kv_offload_mode,
+            cxl_execution_pools=cxl_execution_pools,
         ))
 
     # The derived KV capacity, not the utilization fraction, is what decides
@@ -862,7 +928,14 @@ def main():
                 instance = instances[instance_id]
                 dg = inst_dp_group.get(instance_id)
 
-                if dg is not None:
+                if new_req.kv_transfers:
+                    generate_transfer_graph(new_req, instance['hardware'], instance_id,
+                                            inst2npu_mapping[instance_id], run_paths.inputs_root)
+                    schedulers[instance_id].submit_transfers(new_req)
+                    workload = get_workload(new_req, instance['hardware'], instance_id,
+                                            inputs_root=run_paths.inputs_root)
+                    controller.write_flush(p, workload)
+                elif dg is not None:
                     # DP group: defer trace generation until all members scheduled
                     dp_pending[dg][instance_id].append((new_req, node_id))
 

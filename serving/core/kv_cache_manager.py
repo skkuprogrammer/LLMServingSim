@@ -83,13 +83,39 @@ class TieredKVCacheManager:
             plain vLLM: there is no host KV tier, so a preempted request
             recovers only what is still resident and recomputes the rest.
         enable_caching: mirrors ``--enable-prefix-caching``.
+        kv_offload_mode: ``disabled`` preserves existing behavior. ``explicit``
+            supports completion-aware allocation and GPU/CXL migration.
+        cxl_execution_pools: device ID -> shared non-caching CXL BlockPool,
+            separate from prefix victim tiers; empty in disabled mode.
     """
 
-    def __init__(self, block_size, npu_pool, lower_pools=(), enable_caching=True):
+    def __init__(self, block_size, npu_pool, lower_pools=(), enable_caching=True,
+                 *, kv_offload_mode='disabled', cxl_execution_pools=None):
         self.block_size = block_size
         self.npu_pool = npu_pool
         self.lower_pools = list(lower_pools)
         self.enable_caching = enable_caching and npu_pool.enable_caching
+        if kv_offload_mode not in ('disabled', 'explicit'):
+            raise ValueError(f"Unsupported KV offload mode: {kv_offload_mode}")
+        self.kv_offload_mode = kv_offload_mode
+        # Copy the mapping, never the pools: physical capacity is shared.
+        self.cxl_execution_pools = dict(cxl_execution_pools or {})
+        if kv_offload_mode == 'disabled' and self.cxl_execution_pools:
+            raise ValueError("Disabled KV offload mode must not receive execution pools")
+        if kv_offload_mode == 'explicit':
+            if not self.cxl_execution_pools:
+                raise ValueError("Explicit KV offload mode requires CXL execution pools")
+            if enable_caching or npu_pool.enable_caching or self.lower_pools:
+                raise ValueError("Explicit KV offload pool wiring requires prefix caching disabled")
+            for device_id, pool in self.cxl_execution_pools.items():
+                if type(device_id) is not int or device_id < 0:
+                    raise ValueError("CXL device IDs must be non-negative integers")
+                if pool.tier != Device.CXL or pool.enable_caching:
+                    raise ValueError("CXL execution pools must be non-caching CXL pools")
+                if pool.block_size != block_size or pool.bytes_per_block != npu_pool.bytes_per_block:
+                    raise ValueError("CXL execution pool block shape must match the GPU pool")
+            if len({id(pool) for pool in self.cxl_execution_pools.values()}) != len(self.cxl_execution_pools):
+                raise ValueError("Different CXL device IDs must use distinct pools")
 
         for pool in self.lower_pools:
             if pool.block_size % block_size != 0:
@@ -105,11 +131,53 @@ class TieredKVCacheManager:
         # request id -> how many of those blocks are already indexed
         self.num_cached_block = {}
 
+        self.transfer_ledger = None
+        if kv_offload_mode == 'explicit':
+            from .kv_transfer import KVTransferLedger
+            self.transfer_ledger = KVTransferLedger(
+                self.npu_pool, self.cxl_execution_pools, self.req_to_blocks)
+
         # Drained once per scheduling step by take_traffic().
         self._recall_bytes = 0
         self._write_through_bytes = 0
 
     # -------------------- helpers --------------------
+
+    def _explicit_transfers(self):
+        if self.transfer_ledger is None:
+            raise RuntimeError('KV transfer bookkeeping requires explicit mode')
+        return self.transfer_ledger
+
+    def register_gpu_blocks(self, req_id, blocks, num_tokens):
+        """Adopt exclusive, valid GPU data; does not simulate computation."""
+        return self._explicit_transfers().register_gpu_blocks(req_id, blocks, num_tokens)
+
+    def plan_offload(self, req_id, batch_id, cxl_device_id=0, *, release_gpu=True):
+        """Return transfer plans, [] for no traffic, or None for insufficient space."""
+        return self._explicit_transfers().plan_offload(
+            req_id, batch_id, cxl_device_id, release_gpu=release_gpu)
+
+    def plan_restore(self, req_id, batch_id, *, keep_cxl_copy=True):
+        return self._explicit_transfers().plan_restore(
+            req_id, batch_id, keep_cxl_copy=keep_cxl_copy)
+
+    def mark_transfer_submitted(self, transfer_id):
+        return self._explicit_transfers().mark_transfer_submitted(transfer_id)
+
+    def complete_transfer(self, transfer_id):
+        return self._explicit_transfers().complete_transfer(transfer_id)
+
+    def rollback_transfer(self, transfer_id):
+        return self._explicit_transfers().rollback_transfer(transfer_id)
+
+    def acquire_gpu(self, req_id):
+        return self._explicit_transfers().acquire_gpu(req_id)
+
+    def release_gpu(self, req_id):
+        return self._explicit_transfers().release_gpu(req_id)
+
+    def mark_gpu_modified(self, req_id):
+        return self._explicit_transfers().mark_gpu_modified(req_id)
 
     def _factor(self, pool):
         return pool.block_size // self.block_size
@@ -249,6 +317,11 @@ class TieredKVCacheManager:
         the block pool: the previous allocator decided whether to preempt
         against one estimate and charged memory later against another.
         """
+        if self.kv_offload_mode == 'explicit':
+            if new_computed_blocks or num_new_computed_tokens or num_lower_tier_tokens:
+                raise ValueError('Explicit execution does not support prefix hits')
+            return self.transfer_ledger.allocate_compute(
+                req.id, req.num_computed_tokens + num_new_tokens)
         new_computed_blocks = new_computed_blocks or []
         req_blocks = self.req_to_blocks.setdefault(req.id, [])
 
@@ -362,6 +435,9 @@ class TieredKVCacheManager:
         Reverse order so the tail is reused first and the head -- the
         recoverable prefix -- survives longest.
         """
+        if self.transfer_ledger is not None:
+            self.transfer_ledger.release_request(req.id)
+            return
         blocks = self.req_to_blocks.pop(req.id, [])
         self.num_cached_block.pop(req.id, None)
         if blocks:
@@ -377,6 +453,8 @@ class TieredKVCacheManager:
         is vLLM's behaviour, not a deviation from it -- with a victim tier the
         recovery is a recall, and without one it is a recompute.
         """
+        if self.transfer_ledger is not None:
+            raise NotImplementedError('Explicit preemption must schedule offload before releasing GPU data')
         self.free(req)
 
     # -------------------- accounting --------------------
@@ -396,6 +474,8 @@ class TieredKVCacheManager:
 
     def is_free(self):
         """Every tier back to a fully free list. End-of-run leak check."""
+        if self.transfer_ledger is not None:
+            return self.transfer_ledger.is_empty() and self.npu_pool.is_free()
         return all(p.is_free() for p in [self.npu_pool] + self.lower_pools)
 
 
@@ -555,6 +635,32 @@ def _selftest():
     m.allocate_slots(r, 64)
     m.free(r)
     assert m.is_free(), m.npu_pool
+
+    # Execution pools share physical capacity across managers, not prefix state.
+    shared = {0: BlockPool(Device.CXL, 2, B, BYTES, enable_caching=False),
+              1: BlockPool(Device.CXL, 2, B, BYTES, enable_caching=False)}
+    managers = [TieredKVCacheManager(
+        B, BlockPool(Device.NPU, 4, B, BYTES, enable_caching=False),
+        enable_caching=False, kv_offload_mode='explicit',
+        cxl_execution_pools=shared) for _ in range(2)]
+    first, second = managers
+    assert first.cxl_execution_pools[0] is second.cxl_execution_pools[0]
+    assert not first.lower_pools and not second.lower_pools
+    reservation = first.cxl_execution_pools[0].get_new_blocks(1)
+    assert second.cxl_execution_pools[0].get_num_free_blocks() == 1
+    assert second.cxl_execution_pools[1].get_num_free_blocks() == 2
+    first.cxl_execution_pools[0].free_blocks(reservation)
+    assert second.cxl_execution_pools[0].get_num_free_blocks() == 2
+    assert first.req_to_blocks == {} and first.npu_pool.is_free()
+    assert first.take_traffic() == (0, 0)
+    for mode, pools in [('disabled', shared), ('explicit', {}), ('unknown', {})]:
+        try:
+            TieredKVCacheManager(B, first.npu_pool, enable_caching=False,
+                                kv_offload_mode=mode, cxl_execution_pools=pools)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid execution pool configuration accepted: {mode}")
 
     print("kv_cache_manager self-test: all checks passed")
 

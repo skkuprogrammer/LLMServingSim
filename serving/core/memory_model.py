@@ -26,7 +26,7 @@ class MemoryModel():
     an allocation that cannot be satisfied says so in the call that asks.
     """
 
-    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0):
+    def __init__(self, model, instance_id, node_id, num_npus, tp_size, npu_mem, cpu_mem, block_size, fp, enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage, cxl_mem=0, ep_size=1, pp_size=1, kv_cache_dtype='auto', npu_memory_utilization=1.0, kv_offload_mode='disabled', cxl_execution_pools=None):
         self.model = model
         self.node_id = node_id
         self.instance_id = instance_id
@@ -44,6 +44,10 @@ class MemoryModel():
         self.enable_prefix_sharing = enable_prefix_sharing
         self.prefix_storage = prefix_storage
         self.npu_memory_utilization = npu_memory_utilization
+        self.kv_offload_mode = kv_offload_mode
+        self.cxl_execution_pools = dict(cxl_execution_pools or {})
+        if kv_offload_mode == 'explicit' and (num_npus != 1 or tp_size != 1 or pp_size != 1 or ep_size != 1):
+            raise ValueError("Explicit KV offload pool wiring currently requires a single-rank instance")
 
         self.config = get_config(model)
         self.n_embd = self.config['hidden_size']
@@ -119,6 +123,8 @@ class MemoryModel():
         self.kv = TieredKVCacheManager(
             block_size, self.npu_pool, self.lower_pools,
             enable_caching=enable_prefix_caching,
+            kv_offload_mode=kv_offload_mode,
+            cxl_execution_pools=self.cxl_execution_pools,
         )
 
     def _build_storage_pool(self, prefix_pool, prefix_storage):

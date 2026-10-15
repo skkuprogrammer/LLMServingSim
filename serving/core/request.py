@@ -13,6 +13,7 @@ class RequestStatus(Enum):
     RUNNING = 2
     PREEMPTED = 3
     FINISHED = 4
+    OFFLOADED = 5
 
 
 # class that manages request of astra-sim
@@ -149,6 +150,7 @@ class Batch:
         # handed the same folder, not just the one that generated it. None means
         # "derive the default path".
         self.workload_name = None
+        self.kv_transfers = ()
 
         # for debugging
         self.scheduled_tokens = None
@@ -161,4 +163,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

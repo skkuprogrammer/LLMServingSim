@@ -352,6 +352,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     mem_required_keys = ["mem_size", "mem_bw", "mem_latency"]
 
     cxl_mem_size = 0
+    cxl_num_devices = 0
     if "cxl_mem" in cluster_config:
         cxl = cluster_config["cxl_mem"]
         for key in mem_required_keys:
@@ -364,6 +365,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             "num-devices": cxl.get("num_devices", 1)
         }
         cxl_mem_size = cxl["mem_size"]
+        cxl_num_devices = cxl.get("num_devices", 1)
 
     # Check if all required arguments are present in each node
     required_keys = ["num_instances", "cpu_mem", "instances"]
@@ -701,6 +703,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "total_npu": total_npu,
         "cpu_mem_size": cpu_mem_size,
         "cxl_mem_size": cxl_mem_size,
+        "cxl_num_devices": cxl_num_devices,
         "power_modeling": power_modeling,
         "power_configs": power_configs,
         "pim_models": pim_models,

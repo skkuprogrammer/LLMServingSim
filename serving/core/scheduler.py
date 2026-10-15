@@ -12,6 +12,7 @@ from .graph_generator import *
 from .trace_generator import *
 from .logger import print_markup, print_rule
 from .pim_model import *
+from .kv_cache_manager import cdiv
 import numpy as np
 
 # class that shedules request of astra-sim
@@ -36,7 +37,8 @@ class Scheduler:
                  enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage,
                  enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
-                 npu_memory_utilization=1.0, reserve_full_isl=True):
+                 npu_memory_utilization=1.0, reserve_full_isl=True,
+                 kv_offload_mode='disabled', cxl_execution_pools=None):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -57,6 +59,10 @@ class Scheduler:
         # vLLM's scheduler_reserve_full_isl, True by default there: admit a
         # request only if its whole sequence fits, not merely its first chunk.
         self.reserve_full_isl = reserve_full_isl
+        self.kv_offload_mode = kv_offload_mode
+        self.offload_admission = None
+        self.offload_stats = {'gpu_to_cxl_bytes': 0, 'cxl_to_gpu_bytes': 0,
+                              'gpu_to_cxl_count': 0, 'cxl_to_gpu_count': 0}
 
         # Requests admitted and still generating. Persistent across steps: this
         # is what gives the scheduler a notion of "already running", which the
@@ -80,7 +86,9 @@ class Scheduler:
                                   block_size, fp, enable_prefix_caching, enable_prefix_sharing,
                                   prefix_pool, prefix_storage, cxl_mem, ep_size=ep_size,
                                   pp_size=pp_size, kv_cache_dtype=kv_cache_dtype,
-                                  npu_memory_utilization=npu_memory_utilization)
+                                  npu_memory_utilization=npu_memory_utilization,
+                                  kv_offload_mode=kv_offload_mode,
+                                  cxl_execution_pools=cxl_execution_pools)
         self.kv = self.memory.kv
 
         self.logger = get_logger(self.__class__, node_id=node_id, instance_id=instance_id)
@@ -114,6 +122,9 @@ class Scheduler:
         if len(self.inflight) >= self.pp_size:
             return None
 
+        if self.kv_offload_mode == 'explicit':
+            return self._schedule_offload(current, sys)
+
         token_budget = self.max_num_batched_tokens
         # (request, tokens scheduled, num_computed_tokens before this step)
         scheduled = []
@@ -129,6 +140,151 @@ class Scheduler:
         if not scheduled:
             return None
         return self._build_batch(current, sys, scheduled)
+
+    def _transfer_batch(self, req, current, sys, direction):
+        """Reserve one migration; no token progress is made by this batch."""
+        batch_id = self.batch_ids + 1
+        if direction == 'gpu_to_cxl':
+            plans = None
+            for device_id in sorted(self.kv.cxl_execution_pools):
+                plans = self.kv.plan_offload(req.id, batch_id, device_id)
+                if plans is not None:
+                    break
+        else:
+            plans = self.kv.plan_restore(req.id, batch_id, keep_cxl_copy=False)
+        if plans is None:
+            return None
+        if not plans:
+            raise RuntimeError('Scheduled migration unexpectedly requires no transfer')
+        batch = Batch(self.get_batch_id(), self.model, 0, 0, [], [], 0, 0,
+                      [], [], [], current, self.kv.npu_used_bytes())
+        batch.kv_transfers = tuple(plans)
+        batch.requests = [req]
+        batch.scheduled_tokens = {}
+        batch.fired.append(sys)
+        self.inflight.append(batch)
+        self.logger.info('KV transfer reserved batch=%d req=%d direction=%s bytes=%d',
+                         batch.batch_id, req.id, direction, plans[0].nbytes)
+        return batch
+
+    def _schedule_offload(self, current, sys):
+        """Single-rank pressure-driven migration, with admission after STORE.
+
+        Dry-run allocations first so a migration never strands compute
+        reservations. Running requests retain priority. At most one admission
+        swap is outstanding; parked requests must drain before another one.
+        This is explicit migration, not the default recompute preemption path.
+        """
+        pool = self.kv.npu_pool
+        block_size = pool.block_size
+        free = pool.get_num_free_blocks()
+        budget = self.max_num_batched_tokens
+        scheduled = []
+        growth = {}
+        for req in self.running:
+            if budget <= 0:
+                break
+            num_new = self._num_new_tokens(req, budget)
+            if num_new <= 0:
+                raise RuntimeError('Resident request has no compute progress to make')
+            needed = max(0, cdiv(req.num_computed_tokens + num_new, block_size)
+                         - len(self.kv.req_to_blocks[req.id]))
+            if needed > free:
+                # Prefer the youngest resident, matching the default victim order.
+                for victim in reversed(self.running):
+                    batch = self._transfer_batch(victim, current, sys, 'gpu_to_cxl')
+                    if batch is not None:
+                        return batch
+                if not scheduled:
+                    raise RuntimeError('KV offload cannot progress: GPU and CXL pools are full')
+                break
+            scheduled.append((req, num_new, req.num_computed_tokens))
+            growth[req.id] = needed
+            free -= needed
+            budget -= num_new
+
+        parked = [r for r in self.waiting if r.status == RequestStatus.OFFLOADED]
+        fresh = [r for r in self.waiting if r.status == RequestStatus.WAITING
+                 and r.arrival <= current]
+        slots = self.max_num_seqs - len(self.running)
+        if parked and self.offload_admission is None:
+            # Restore only when both the snapshot and its next compute fit.
+            # Do not evict a resident merely to immediately restore another.
+            req = parked[0]
+            if slots > 0 and budget > 0:
+                num_new = self._num_new_tokens(req, budget)
+                required = cdiv(req.num_computed_tokens + num_new, block_size)
+                if required <= free:
+                    return self._transfer_batch(req, current, sys, 'cxl_to_gpu')
+        else:
+            for req in fresh:
+                if slots <= 0 or budget <= 0:
+                    break
+                num_new = self._num_new_tokens(req, budget)
+                if not self.enable_chunked_prefill and req.num_tokens > budget:
+                    break
+                required = cdiv(req.num_computed_tokens + num_new, block_size)
+                admission = cdiv(req.num_tokens, block_size) if self.reserve_full_isl else required
+                if admission > free:
+                    # Swap for a new admission only when it will fit after one
+                    # victim and no previously parked request is waiting.
+                    if not parked:
+                        for victim in reversed(self.running):
+                            released = len(self.kv.req_to_blocks[victim.id])
+                            if admission > free + released + growth.get(victim.id, 0):
+                                continue
+                            batch = self._transfer_batch(victim, current, sys, 'gpu_to_cxl')
+                            if batch is not None:
+                                self.offload_admission = req.id
+                                return batch
+                    break
+                scheduled.append((req, num_new, req.num_computed_tokens))
+                free -= required
+                budget -= num_new
+                slots -= 1
+
+        for req, num_new, _ in scheduled:
+            if self.kv.allocate_slots(req, num_new) is None:
+                raise RuntimeError('KV allocation changed after scheduling preflight')
+            if req.status == RequestStatus.WAITING:
+                self.waiting.remove(req)
+                req.status = RequestStatus.RUNNING
+                self.running.append(req)
+                if self.offload_admission == req.id:
+                    self.offload_admission = None
+                self.logger.info('KV admission req=%d tick=%d gpu_free_blocks=%d',
+                                 req.id, current, pool.get_num_free_blocks())
+        if not scheduled:
+            return None
+        return self._build_batch(current, sys, scheduled)
+
+    def submit_transfers(self, batch):
+        """Called after graph generation, immediately before backend dispatch."""
+        for plan in batch.kv_transfers:
+            self.kv.mark_transfer_submitted(plan.transfer_id)
+
+    def _complete_transfer_batch(self, batch, finish):
+        req = batch.requests[0]
+        for plan in batch.kv_transfers:
+            self.kv.complete_transfer(plan.transfer_id)
+            self.offload_stats[plan.direction + '_bytes'] += plan.nbytes
+            self.offload_stats[plan.direction + '_count'] += 1
+            if plan.direction == 'gpu_to_cxl':
+                self.running.remove(req)
+                req.status = RequestStatus.OFFLOADED
+                bisect.insort(self.waiting, req, key=lambda r: (r.arrival, r.id))
+            else:
+                self.waiting.remove(req)
+                req.status = RequestStatus.RUNNING
+                self.running.append(req)
+            self.logger.info(
+                'KV transfer complete batch=%d req=%d direction=%s tick=%d '
+                'bytes=%d gpu_free_blocks=%d cxl_used_bytes=%d',
+                batch.batch_id, req.id, plan.direction, finish, plan.nbytes,
+                self.kv.npu_pool.get_num_free_blocks(),
+                sum(p.used_bytes() for p in self.kv.cxl_execution_pools.values()))
+        self.inflight.remove(batch)
+        return 0, 0, []
 
     def _schedule_running(self, scheduled, preempted, token_budget):
         """Phase A: serve requests already running, preempting from the tail."""
@@ -376,6 +532,12 @@ class Scheduler:
 
         self.logger.info("Batch #%d is done", batch.batch_id)
 
+        if batch.kv_transfers:
+            return self._complete_transfer_batch(batch, finish)
+        if self.kv_offload_mode == 'explicit':
+            for req in batch.requests:
+                self.kv.transfer_ledger.complete_compute(req.id)
+
         for req in batch.requests:
             if req.status == RequestStatus.FINISHED:
                 # With pp_size > 1 a request is legitimately in more than one
@@ -463,6 +625,10 @@ class Scheduler:
 
     def add_request(self, req, is_init=True):
         new_req = Request(*(req), is_init=is_init)
+        if (self.kv_offload_mode == 'explicit'
+                and cdiv(new_req.output - 1, self.kv.block_size) > self.kv.npu_pool.num_blocks):
+            raise ValueError('Request KV exceeds GPU capacity even when running alone; '
+                             'layer-wise staging is not supported by --offload')
         # Arrival order, which phase B relies on to stop at the first request
         # that has not arrived yet. Dynamically released agentic sub-requests
         # arrive mid-run, hence insort rather than append.
@@ -525,6 +691,8 @@ class Scheduler:
         }
 
     def print_result(self):
+        if self.kv_offload_mode == 'explicit':
+            print_markup(f"KV offload transfers: {self.offload_stats}")
         # Extract ttft, tpot, and itl values from the completed requests
         ttft_values = [req.ttft for req in self.done]
         tpot_values = [req.tpot for req in self.done]
